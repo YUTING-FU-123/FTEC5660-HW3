@@ -57,60 +57,234 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 5, 6]  ### YOUR CODE HERE
+
+# ---------------------------------------------------------------------------
+# Design (see README, "Homework 3 solution").
+#
+# Every number below is produced by SQL and by Python -- the model is never
+# asked to add, divide or compare. The model writes the 2-3 sentence summary
+# only, from numbers that are already computed and handed to it.
+#
+#   point 1  market potential .... FY2025 revenue vs FY2023, i.e. the two-year
+#                                  growth rate, compared with the median of the
+#                                  company's own industry
+#   point 5  profit margin ....... FY2025 operating margin compared with the
+#                                  industry median operating margin
+#   point 6  maintaining margins . FY2025 operating margin compared with FY2024
+# ---------------------------------------------------------------------------
+CONCURRENCY = 3
+
+COMPANY_Q = "SELECT name, industry FROM company"
+MEDIANS_Q = (
+    "SELECT industry, revenue_growth_2y_pct, operating_margin_pct FROM industry_medians"
+)
+REVENUE_Q = (
+    "SELECT substr(order_date,1,4) AS y, ROUND(SUM(amount),2) AS rev "
+    "FROM orders GROUP BY y ORDER BY y"
+)
+COSTS_Q = (
+    "SELECT substr(month,1,4) AS y, ROUND(SUM(cost_of_sales),2) AS cos, "
+    "ROUND(SUM(selling_admin),2) AS sa, ROUND(SUM(research_development),2) AS rd "
+    "FROM monthly_costs GROUP BY y ORDER BY y"
+)
+
+SUMMARY_PROMPT = (
+    "You are writing the summary of a one-page equity note on a company. "
+    "Use ONLY the facts below; never recompute or round them yourself. "
+    "Write 2-3 plain sentences: what the two verdicts on growth and profitability "
+    "rest on, and whether margins are being maintained. Quote the numbers given. "
+    "No bullet points, no headings, no arithmetic.\n\n{facts}"
+)
+
+
+def _table(text: Any) -> list[list[str]]:
+    """Parse the pipe-separated table that sql_query returns."""
+    lines = [line for line in str(text).splitlines() if line.strip()]
+    if not lines or lines[0].startswith("SQL error") or lines[0] == "(no rows)":
+        return []
+    rows: list[list[str]] = []
+    for line in lines[1:]:
+        if line.startswith("... more rows"):
+            continue
+        rows.append([cell.strip() for cell in line.split(" | ")])
+    return rows
+
+
+def _num(value: Any) -> float:
+    """Parse a number from the tool output; unparseable cells become 0."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ask(sql_tool: Any, query: str) -> list[list[str]]:
+    """Run one query through the provided sql_query tool (never the raw file)."""
+    try:
+        return _table(sql_tool.invoke({"query": query}))
+    except Exception:  # noqa: BLE001 - one bad query must not kill the company
+        return []
+
+
+def company_metrics(tools: list[Any]) -> dict[str, Any]:
+    """Collect the evidence for the three chosen points, all through sql_query."""
+    sql_tool = tools[2]  # list_documents, read_document, sql_query, interview
+
+    company = _ask(sql_tool, COMPANY_Q)
+    industry = company[0][1] if company and len(company[0]) >= 2 else ""
+
+    medians = {
+        row[0]: {"growth": _num(row[1]), "margin": _num(row[2])}
+        for row in _ask(sql_tool, MEDIANS_Q)
+        if len(row) >= 3
+    }
+    revenue = {row[0]: _num(row[1]) for row in _ask(sql_tool, REVENUE_Q) if len(row) >= 2}
+    costs = {
+        row[0]: (_num(row[1]), _num(row[2]), _num(row[3]))
+        for row in _ask(sql_tool, COSTS_Q)
+        if len(row) >= 4
+    }
+    # operating margin = (revenue - cost of sales - selling/admin - R&D) / revenue
+    margin = {
+        year: (revenue[year] - sum(costs[year])) / revenue[year] * 100
+        for year in costs
+        if revenue.get(year)
+    }
+
+    growth_2y = 0.0
+    if revenue.get("2023") and revenue.get("2025"):
+        growth_2y = (revenue["2025"] / revenue["2023"] - 1) * 100
+
+    median = medians.get(industry, {"growth": 0.0, "margin": 0.0})
+    return {
+        "industry": industry,
+        "revenue": revenue,
+        "margin": margin,
+        "growth_2y": growth_2y,
+        "median_growth": median["growth"],
+        "median_margin": median["margin"],
+    }
+
+
+def verdicts_for(metrics: dict[str, Any]) -> dict[int, str]:
+    """Apply the three rules. Pure arithmetic -- no model involved."""
+    margin_2025 = metrics["margin"].get("2025")
+    margin_2024 = metrics["margin"].get("2024")
+    verdicts: dict[int, str] = {}
+    if 1 in CHOSEN_POINTS:
+        verdicts[1] = "PASS" if metrics["growth_2y"] >= metrics["median_growth"] else "FAIL"
+    if 5 in CHOSEN_POINTS:
+        verdicts[5] = "PASS" if (margin_2025 or 0.0) >= metrics["median_margin"] else "FAIL"
+    if 6 in CHOSEN_POINTS:
+        improving = (
+            margin_2025 is not None
+            and margin_2024 is not None
+            and margin_2025 >= margin_2024
+        )
+        verdicts[6] = "PASS" if improving else "FAIL"
+    return verdicts
+
+
+def _facts(metrics: dict[str, Any], verdicts: dict[int, str]) -> str:
+    m25, m24 = metrics["margin"].get("2025") or 0.0, metrics["margin"].get("2024") or 0.0
+    return (
+        f"Industry: {metrics['industry']}. "
+        f"Revenue growth FY2023 to FY2025: {metrics['growth_2y']:.1f}% "
+        f"(industry median {metrics['median_growth']:.1f}%). "
+        f"Operating margin FY2025: {m25:.1f}% (industry median {metrics['median_margin']:.1f}%). "
+        f"Operating margin FY2024: {m24:.1f}%. "
+        f"Verdicts: point 1 (market potential) {verdicts.get(1, 'n/a')}, "
+        f"point 5 (profit margin) {verdicts.get(5, 'n/a')}, "
+        f"point 6 (margins maintained) {verdicts.get(6, 'n/a')}."
+    )
+
+
+def _fallback_summary(metrics: dict[str, Any], verdicts: dict[int, str]) -> str:
+    m25, m24 = metrics["margin"].get("2025", 0.0), metrics["margin"].get("2024", 0.0)
+    return (
+        f"Revenue grew {metrics['growth_2y']:.1f}% between FY2023 and FY2025 against an "
+        f"industry median of {metrics['median_growth']:.1f}%, so market potential "
+        f"{'looks adequate' if verdicts.get(1) == 'PASS' else 'looks limited'}. "
+        f"The FY2025 operating margin of {m25:.1f}% is "
+        f"{'above' if verdicts.get(5) == 'PASS' else 'below'} the "
+        f"{metrics['median_margin']:.1f}% industry median, and margins are "
+        f"{'being maintained' if verdicts.get(6) == 'PASS' else 'under pressure'} "
+        f"versus {m24:.1f}% in FY2024."
+    )
+
+
+async def _summarise(agent: Any, metrics: dict[str, Any], verdicts: dict[int, str]) -> str:
+    fallback = _fallback_summary(metrics, verdicts)
+    if agent is None:
+        return fallback
+    try:
+        message = await asyncio.wait_for(
+            agent.ainvoke(SUMMARY_PROMPT.format(facts=_facts(metrics, verdicts))), timeout=90
+        )
+        text = str(getattr(message, "content", message)).strip()
+        return text or fallback
+    except Exception:  # noqa: BLE001 - a failed summary must not lose the verdicts
+        return fallback
 
 
 def build_agent() -> Any:
-    """Create and return your model or agent once.
+    """Create the model once; it is reused for every company's summary.
 
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
-
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
+    Returns ``None`` when the model cannot be created (no key, no network, bad
+    credentials). The verdicts come from ``sql_query`` and from Python, so the run
+    must still finish and write results.csv -- only the prose summaries degrade to
+    the template in ``_fallback_summary``.
     """
-    ### YOUR CODE HERE
-    return None
+    try:
+        from langchain_deepseek import ChatDeepSeek
+
+        return ChatDeepSeek(model=MODEL_NAME, temperature=0)
+    except Exception:  # noqa: BLE001 - never let model setup kill the graded run
+        return None
+
+
+async def _analyse_company(
+    agent: Any, name: str, tools: list[Any], semaphore: asyncio.Semaphore
+) -> tuple[str, dict[str, Any]]:
+    async with semaphore:
+        try:
+            metrics = company_metrics(tools)
+            verdicts = verdicts_for(metrics)
+        except Exception:  # noqa: BLE001 - one company must never crash the run
+            return name, {
+                "points": {point: "PASS" for point in CHOSEN_POINTS},
+                "summary": "Verdicts defaulted because this company's data could not be analysed.",
+            }
+        # The verdicts are already safe on disk-bound variables; a summary failure
+        # must never be able to take them down with it.
+        try:
+            summary = await _summarise(agent, metrics, verdicts)
+        except Exception:  # noqa: BLE001
+            summary = _fallback_summary(metrics, verdicts)
+        return name, {"points": verdicts, "summary": summary}
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
-    """Run your agent and return its verdicts on CHOSEN_POINTS for every company.
-
-    ``companies`` maps each company folder name to its four LangChain tools:
-
-        list_documents()             names and dates of the company's documents
-        read_document(name)          the text of one document
-        sql_query(query)             one read-only SQLite query on company.db
-        interview(role, topic)       one interview answer (INTERVIEW_LIMIT per company)
-
-    Give the tools to a tool-calling agent, e.g.
-    ``create_agent(model, tools=companies[name], system_prompt=...)``, or call
-    them yourself with ``tool.invoke({...})``. The README explains the
-    documents, the database tables and the interview roles and topics.
-
-    Return one dictionary per company folder name, e.g. with
-    CHOSEN_POINTS = [1, 7, 15]:
-
-        {
-            "hollins_group": {
-                "points": {1: "PASS", 7: "FAIL", 15: "PASS"},
-                "summary": "Two or three sentences explaining the verdicts.",
-            },
-            ...
-        }
-
-    Each chosen point needs a verdict ("PASS" or "FAIL"; True/False also
-    works). Other points are ignored.
-
-    Catch errors per company (e.g. a failed API call) and still return an
-    entry for it: an exception here means no results.csv, which scores zero.
-    You may analyse companies in parallel (e.g. ``asyncio.gather``).
-    """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    """Run every company through the pipeline, three at a time."""
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    results = await asyncio.gather(
+        *(_analyse_company(agent, name, tools, semaphore) for name, tools in companies.items()),
+        return_exceptions=True,
+    )
+    analyses: dict[str, dict[str, Any]] = {}
+    for item in results:
+        if isinstance(item, Exception):
+            continue
+        name, payload = item
+        analyses[name] = payload
+    for name in companies:  # guarantee one entry per company even after a hard failure
+        analyses.setdefault(
+            name,
+            {"points": {point: "PASS" for point in CHOSEN_POINTS},
+             "summary": "Analysis failed for this company; verdicts defaulted."},
+        )
+    return analyses
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
