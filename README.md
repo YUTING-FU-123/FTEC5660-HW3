@@ -204,24 +204,24 @@ common cause of wrong verdicts — so no number in this submission is produced b
 
 ```mermaid
 flowchart TD
-    A[company folder] --> B[sql_query: company + industry_medians]
-    A --> C[sql_query: revenue by year]
-    A --> D[sql_query: monthly_costs by year]
-    C --> E[Python: two-year growth %]
-    D --> F[Python: operating margin per year]
-    B --> G[median for the company's industry]
+    A["company folder"] --> B["sql_query: company + industry_medians"]
+    A --> C["sql_query: revenue by year"]
+    A --> D["sql_query: monthly_costs by year"]
+    C --> E["Python: two-year growth pct"]
+    D --> F["Python: operating margin per year"]
+    B --> G["median for the company's industry"]
     E --> H{"Rule 1: growth >= median?"}
     G --> H
     F --> I{"Rule 5: margin FY25 >= median?"}
     G --> I
     F --> J{"Rule 6: margin FY25 >= FY24?"}
-    H --> K[verdicts dict per company]
+    H --> K["verdicts dict per company"]
     I --> K
     J --> K
-    K --> L["DeepSeek deepseek-v4-flash: 2-3 sentence summary (given the numbers, no arithmetic)"]
-    K --> M[results.csv row]
+    K --> L["DeepSeek deepseek-v4-flash: 2-3 sentence summary, given the numbers, no arithmetic"]
+    K --> M["results.csv row"]
     L --> M
-    F -.->|per-company try/except, fallback verdicts| K
+    F -.->|"per-company try/except falls back to default verdicts"| K
 ```
 
 The agent is a two-layer pipeline rather than one free-running tool-calling loop. Layer one is
@@ -252,11 +252,11 @@ industry-median columns, and then simply reproduced the key.
 Why I expect this to hold on the private set rather than being a fit to 20 companies: the data
 never sits near a line. The closest company is 3.1 percentage points from the industry median on
 growth and 1.7 points from it on margin, and on the trend test every company's margin moves
-monotonically across FY2023–FY2025, so all five plausible windows (vs FY2024, vs FY2023, vs the
-max, vs the min of the two) give the same verdict on all 20 companies. A rule that agrees with
+monotonically across FY2023–FY2025, so all four plausible windows (vs FY2024, vs FY2023, vs the
+larger of the two, vs the smaller of the two) give the same verdict on all 20 companies. A rule that agrees with
 every reasonable variant is measuring the data, not the answer key. What would break it is a
 company within rounding distance of its industry median, or a non-monotone margin path; nothing in
 the public set looks like that.
 
-Runtime: about two minutes for 20 companies (the model only writes summaries), against the 30
-minute limit. No interviews are used, because none of the three chosen points needs scuttlebutt.
+Runtime: about twenty seconds for 20 companies on this machine (the model only writes summaries),
+against the 30 minute limit. No interviews are used, because none of the three chosen points needs scuttlebutt.
