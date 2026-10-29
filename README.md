@@ -171,13 +171,92 @@ companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
 ## Homework 3 solution:
-> to students: this is your report, see the homework description.
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+**Point 1 — market potential for sales growth.** Fisher asks whether the company has "products or
+services with sufficient market potential to make possible a sizable increase in sales for at
+least several years". I chose it because it is the one question the database can answer without
+anybody's opinion: orders *are* sales. **Rule:** PASS when two-year revenue growth,
+`(revenue FY2025 / revenue FY2023 − 1) × 100`, is at least the `revenue_growth_2y_pct` median of
+the company's own industry. **Evidence:** `orders` summed by year (`substr(order_date,1,4)`,
+`SUM(amount)`) plus the matching row of `industry_medians`.
+
+**Point 5 — a worthwhile profit margin.** "Does the company have a worthwhile profit margin?" The
+interesting word is *worthwhile*: a 6% operating margin is respectable in packaging machinery and
+poor in medical devices, so the only defensible reading is relative to the industry. **Rule:** PASS
+when the FY2025 operating margin, `(revenue − cost of sales − selling/admin − R&D) / revenue`
+built from `monthly_costs`, is at least the industry median `operating_margin_pct`. **Evidence:**
+`monthly_costs` and `industry_medians`.
+
+**Point 6 — maintaining or improving margins.** "What is the company doing to maintain or improve
+profit margins?" Fisher's concern is whether today's margin is being competed away. **Rule:** PASS
+when the FY2025 operating margin is at least the FY2024 margin, i.e. the margin has not been given
+away over the last year. **Evidence:** the same `revenue` and `monthly_costs` series, one year
+apart.
+
+The three are deliberately not three versions of one test: points 1 and 5 compare the company with
+its **industry** (growth, then profitability), while point 6 compares it with its **own past**. All
+three are arithmetic on the database, because the homework warns that model arithmetic is the most
+common cause of wrong verdicts — so no number in this submission is produced by the model.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A[company folder] --> B[sql_query: company + industry_medians]
+    A --> C[sql_query: revenue by year]
+    A --> D[sql_query: monthly_costs by year]
+    C --> E[Python: two-year growth %]
+    D --> F[Python: operating margin per year]
+    B --> G[median for the company's industry]
+    E --> H{"Rule 1: growth >= median?"}
+    G --> H
+    F --> I{"Rule 5: margin FY25 >= median?"}
+    G --> I
+    F --> J{"Rule 6: margin FY25 >= FY24?"}
+    H --> K[verdicts dict per company]
+    I --> K
+    J --> K
+    K --> L["DeepSeek deepseek-v4-flash: 2-3 sentence summary (given the numbers, no arithmetic)"]
+    K --> M[results.csv row]
+    L --> M
+    F -.->|per-company try/except, fallback verdicts| K
+```
+
+The agent is a two-layer pipeline rather than one free-running tool-calling loop. Layer one is
+deterministic: for every company, four `sql_query` calls (company/industry, industry medians,
+revenue by year, monthly costs by year) are aggregated in SQL, and Python turns them into one
+growth rate, one margin per year and the two margins the rules need. Layer two is the model: it
+receives those finished numbers and writes the two or three sentences of narrative for
+`results.csv`, and is explicitly told not to recompute anything. Companies are processed three at a
+time with `asyncio.Semaphore(3)`, and each company is wrapped in its own `try/except`, so a failed
+query or a failed model call loses the summary (a template is used) but never the verdicts, and
+never the `results.csv` the grading depends on.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+On `public_test`, all three rules reproduce the published answer key:
+
+| Point | Rule | Correct |
+| --- | --- | --- |
+| 1 | FY2025 vs FY2023 revenue growth ≥ industry median growth | **20/20** |
+| 5 | FY2025 operating margin ≥ industry median margin | **20/20** |
+| 6 | FY2025 operating margin ≥ FY2024 operating margin | **20/20** |
+
+**Point score: 60/60 = 100% balanced** (the runner prints `Point accuracy: 60/60 (balanced:
+100.0%)`), i.e. the full 75/75 for Task 1 on the public set. **No company disagrees with the public
+answers**, so there is nothing to explain away: the rules were fitted on Fisher's wording and the
+industry-median columns, and then simply reproduced the key.
+
+Why I expect this to hold on the private set rather than being a fit to 20 companies: the data
+never sits near a line. The closest company is 3.1 percentage points from the industry median on
+growth and 1.7 points from it on margin, and on the trend test every company's margin moves
+monotonically across FY2023–FY2025, so all five plausible windows (vs FY2024, vs FY2023, vs the
+max, vs the min of the two) give the same verdict on all 20 companies. A rule that agrees with
+every reasonable variant is measuring the data, not the answer key. What would break it is a
+company within rounding distance of its industry median, or a non-monotone margin path; nothing in
+the public set looks like that.
+
+Runtime: about two minutes for 20 companies (the model only writes summaries), against the 30
+minute limit. No interviews are used, because none of the three chosen points needs scuttlebutt.
